@@ -1,33 +1,17 @@
-#!/usr/bin/env python3
-"""
-scanner.py — Web vulnerability scanner using Claude API for analysis.
-
-Usage:
-    python3 scanner.py <URL> [--output/-o report.md] [--disable-ai]
-
-Checks:
-    - Exposed credentials in client-side JS (inline + external)
-    - Unauthenticated/sensitive endpoints
-    - Open/listable S3 buckets
-
-Requires:
-    pip install httpx beautifulsoup4 anthropic typer
-    ANTHROPIC_API_KEY env var set
-"""
-
+import datetime
 import json
 import re
-import sys
-from datetime import datetime
 from urllib.parse import urljoin, urlparse
-from zoneinfo import ZoneInfo
 
 import anthropic
 import httpx
 import typer
 from bs4 import BeautifulSoup
+from rich.console import Console
 
 app = typer.Typer(rich_markup_mode="rich")
+
+stderr = Console(stderr=True)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -265,7 +249,7 @@ def _call_claude(client: anthropic.Anthropic, prompt: str) -> list[dict]:
     try:
         return json.loads(text).get("findings", [])
     except json.JSONDecodeError:
-        print("[warn] Claude returned non-JSON; skipping block", file=sys.stderr)
+        stderr.print("[yellow][warn][/yellow] Claude returned non-JSON; skipping block")
         return []
 
 
@@ -313,7 +297,7 @@ def build_report(
     endpoint_findings: list[dict],
     s3_results: list[dict],
 ) -> str:
-    now = datetime.now(tz=ZoneInfo("")).strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
         "# Security Scan Report",
         "",
@@ -414,37 +398,51 @@ def build_report(
 
 def scan(url: str, output_path: str | None = None, disable_ai: bool = False) -> str:
 
-    typer.echo(f"[1/4] Fetching [cyan]{url}[/cyan] ...", file=sys.stderr)
-    html, final_url = fetch_page(url)
+    with stderr.status(f"[bold]Fetching[/bold] [cyan]{url}[/cyan] ...") as status:
+        html, final_url = fetch_page(url)
+        stderr.log(f"[green]✓[/green] Fetched [cyan]{final_url}[/cyan]")
 
-    typer.echo("[2/4] Collecting JS files and probing endpoints ...", file=sys.stderr)
-    js_files = collect_js_files(final_url, html)
-    probes = probe_endpoints(final_url)
-    buckets = extract_s3_buckets(html, js_files)
-    typer.echo(
-        f"      [dim]{len(js_files)} JS files, {len(probes)} probes, {len(buckets)} S3 refs[/dim]",
-        file=sys.stderr,
-    )
+        status.update("[bold]Collecting JS files and probing endpoints ...[/bold]")
+        js_files = collect_js_files(final_url, html)
+        probes = probe_endpoints(final_url)
+        buckets = extract_s3_buckets(html, js_files)
+        stderr.log(
+            f"[green]✓[/green] [dim]{len(js_files)} JS files, {len(probes)} probes, {len(buckets)} S3 refs[/dim]"
+        )
 
-    if disable_ai:
-        typer.echo("[3/4] [dim]AI analysis disabled, skipping ...[/dim]", file=sys.stderr)
-        js_findings = []
-        endpoint_findings = []
+        if disable_ai:
+            status.update("[dim]AI analysis disabled, skipping ...[/dim]")
+            js_findings: list[dict] = []
+            endpoint_findings: list[dict] = []
+        else:
+            client = anthropic.Anthropic()
+            status.update(
+                f"[bold]Analyzing JS with [yellow]Claude ({MODEL})[/yellow] ...[/bold]"
+            )
+            js_findings = analyze_js(client, js_files)
+            stderr.log(
+                f"[green]✓[/green] JS analysis done — {len(js_findings)} finding(s)"
+            )
+
+            status.update(
+                f"[bold]Analyzing endpoints with [yellow]Claude ({MODEL})[/yellow] ...[/bold]"
+            )
+            endpoint_findings = analyze_endpoints(client, probes)
+            stderr.log(
+                f"[green]✓[/green] Endpoint analysis done — {len(endpoint_findings)} finding(s)"
+            )
+
+        status.update("[bold]Checking S3 buckets ...[/bold]")
         s3_results = [check_bucket(b) for b in buckets]
-    else:
-        client = anthropic.Anthropic()
-        typer.echo(f"[3/4] Analyzing with [bold yellow]Claude ({MODEL})[/bold yellow] ...", file=sys.stderr)
-        js_findings = analyze_js(client, js_files)
-        endpoint_findings = analyze_endpoints(client, probes)
-        s3_results = [check_bucket(b) for b in buckets]
+        stderr.log(f"[green]✓[/green] S3 checks done — {len(s3_results)} bucket(s)")
 
-    typer.echo("[4/4] Building report ...", file=sys.stderr)
-    report = build_report(final_url, js_findings, endpoint_findings, s3_results)
+        status.update("[bold]Building report ...[/bold]")
+        report = build_report(final_url, js_findings, endpoint_findings, s3_results)
 
     if output_path:
         with open(output_path, "w") as fh:
             fh.write(report)
-        typer.secho(f"✓ Report written to {output_path}", fg=typer.colors.GREEN, file=sys.stderr)
+        stderr.print(f"\n[bold green]✓ Report written to {output_path}[/bold green]")
     else:
         typer.echo(report)
 
@@ -454,8 +452,14 @@ def scan(url: str, output_path: str | None = None, disable_ai: bool = False) -> 
 @app.command()
 def main(
     url: str,
-    output: str | None = typer.Option(None, "--output", "-o", help="Write report to this file (default: stdout)"),
-    disable_ai: bool = typer.Option(False, "--disable-ai", help="Skip AI analysis (JS credentials and endpoint audit)"),
+    output: str | None = typer.Option(
+        None, "--output", "-o", help="Write report to this file (default: stdout)"
+    ),
+    disable_ai: bool = typer.Option(
+        False,
+        "--disable-ai",
+        help="Skip AI analysis (JS credentials and endpoint audit)",
+    ),
 ) -> None:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
